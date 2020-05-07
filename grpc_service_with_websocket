@@ -1,0 +1,283 @@
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
+	cli "github.com/jawher/mow.cli"
+	"github.com/opentracing/opentracing-go"
+	"github.com/tmc/grpc-websocket-proxy/wsproxy"
+	"gitlab.com/bitboardexchange.com/common/api"
+	ch "gitlab.com/bitboardexchange.com/common/clickhouse"
+	"gitlab.com/bitboardexchange.com/common/command"
+	"gitlab.com/bitboardexchange.com/common/config"
+	"gitlab.com/bitboardexchange.com/common/logger"
+	pg "gitlab.com/bitboardexchange.com/common/postgres"
+	"gitlab.com/bitboardexchange.com/common/redis"
+	"gitlab.com/bitboardexchange.com/mark/clickhouse"
+	"gitlab.com/bitboardexchange.com/mark/handlers/grpc"
+	"gitlab.com/bitboardexchange.com/mark/handlers/rest"
+	"gitlab.com/bitboardexchange.com/mark/postgres"
+	"gitlab.com/bitboardexchange.com/proto/proto"
+	rpc "google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/grpclog"
+	"io/ioutil"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+)
+
+const (
+	key = `-----BEGIN RSA PRIVATE KEY-----
+MIIEogIBAAKCAQEAt+BLF4XtYPGwYGlZJLQFtAN0GWpAc+ookZCJko3uEu2BID4K
+abztgfvKld07iT87ovfkq9w0sFLWK853ZibeP3phC/h8Sde0Kf69ruhKhuzqorw3
+aQ7T0nZKg/qMmFYc6KReFv8U5cfmG3pG3ozhbMZ7jG/fnr5irNKdx8Rl287WGSUv
+Ro5m6PZZ/TJWyOqPjB//QLC0AI9b3zUxOxCuM2HcAHgTR9kcMDMEI102y9hVqmkZ
+9p7rDAWK31YMS3zBpEsgPaYY1CtWiQdGWNylKV1aGo781IUHnzqSj232WtWnHnAC
+++gaP2IM9+YQu+Uz1vI52nKrRWvwkcwmSSjAowIDAQABAoIBABEdW1/xI0sms9gF
+djqoVu+Ocrv628zuOqBx55wwgbxZRu+NVsLIxwKWQSD52pTHwfFFSY+Fi5Ht4+ln
+6k0jyQP3jBjlJAxre2V9RIKHNIiifKRxCGdK7gRk5kKqi3OScFZnFirlyzgoBw7/
+rqEAU+sf/lfwAcxwxBZ59B2n9iMjUNHNOjEnHkPin3OnGqgkNDbF+FjG9g4+0KsA
+ptb1jtSaSblCf+zxLg+M0Bwv/HOEiLJRxMtElTs/qFWV0/y1mg4oYm6p90u0KKc7
+edyIJ0Unk9WH61al/y5mzsIkmGdQhiRtleqka0xN6E4mmfpgv0b0PRT+8ddeFEOE
+tqDfFMECgYEA7iNCPgKJisboyZfyyKtH6YgftJ+wm6XwYaeAXaEnZ+KVInF5GuNl
+NpG0HkTk/Z35QvihfCJo9X8TC5+5T1C9ZCbnyX4rZ7J2vmGQK2cGNdsdAPjLp54W
+RyA2nPpxZSnTlWVqFOZbLCltK4RiZPO1GPNIvu4NNh4UcmpvpEJ62BkCgYEAxasZ
+VQw7RhmfTVIBAtD3k0HaY9yfc5+/FgHu1PXi/Qi8rf6ekFZOKxYQykvqg+bSTlYF
+F/50uJ8KLx91ZBIDvVpeciaIte4GVN1DBR8T4hK0zsLtbnP8BU5AAfbhmeylgymB
+uAVWSo0XxZUiTTsQTvDxqYoGKCw2myDGAeAqZhsCgYBoRzRIpx/Hj1Z8gHcl/Crf
+TmZj19GkNsPOX2TMmzcAPK4FiR748T5u6NqwroZ/sF9oPiuoigDgD6ctXeHto3Nr
+mcXB6+fh3ro0n9Bb0R9dEfffZxL28TjcKHUBxIFHRUuLjf8n679c1T8i4TOc9UMG
+C/J8+Qz796wIdicxDJNycQKBgHS4qvXAikPDn4C92qD6GidXbIkpXvKcsu5g59HS
+/F1kSl4IC0O54uCoX/PEzk9i/m6JduqLNAtMxmu7DMuxo4mtkjWfsXyUeCKmoQum
+JUyKtT+edSuSy4+qfDtsuBz3U2jXGqU6aZEOLapbfOzT4rZqqpjtSuNv8DK8MJAs
++XxfAoGAAQuKp7ZxsRommZNK8op54o/6MCX1+o6B3j/rdYn+XE6ef15BRqRq0YJa
+4WlR4xVtJSDs/h0DtOvioWOJuDtH926Jh1L+17UD8Y2tBOnsd0Xa3mLQJnRbD4sV
+a2vU2hcHbZEVYc2O6By6znfkWvqloshcYZ+AITi4ZB9BTRKEWp8=
+-----END RSA PRIVATE KEY-----`
+	cert = `-----BEGIN CERTIFICATE-----
+MIIDXDCCAkQCCQDGok0Ckb/jJTANBgkqhkiG9w0BAQsFADBwMQswCQYDVQQGEwJV
+UzESMBAGA1UECAwJV2lzY29uc2luMRAwDgYDVQQHDAdNYWRpc29uMRMwEQYDVQQK
+DApVbml2ZXJjaXR5MQ0wCwYDVQQLDARUZXN0MRcwFQYDVQQDDA5sb2NhbGhvc3Q6
+ODAyMDAeFw0yMDA1MDYxNTEyMDRaFw0zMDA1MDQxNTEyMDRaMHAxCzAJBgNVBAYT
+AlVTMRIwEAYDVQQIDAlXaXNjb25zaW4xEDAOBgNVBAcMB01hZGlzb24xEzARBgNV
+BAoMClVuaXZlcmNpdHkxDTALBgNVBAsMBFRlc3QxFzAVBgNVBAMMDmxvY2FsaG9z
+dDo4MDIwMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAt+BLF4XtYPGw
+YGlZJLQFtAN0GWpAc+ookZCJko3uEu2BID4KabztgfvKld07iT87ovfkq9w0sFLW
+K853ZibeP3phC/h8Sde0Kf69ruhKhuzqorw3aQ7T0nZKg/qMmFYc6KReFv8U5cfm
+G3pG3ozhbMZ7jG/fnr5irNKdx8Rl287WGSUvRo5m6PZZ/TJWyOqPjB//QLC0AI9b
+3zUxOxCuM2HcAHgTR9kcMDMEI102y9hVqmkZ9p7rDAWK31YMS3zBpEsgPaYY1CtW
+iQdGWNylKV1aGo781IUHnzqSj232WtWnHnAC++gaP2IM9+YQu+Uz1vI52nKrRWvw
+kcwmSSjAowIDAQABMA0GCSqGSIb3DQEBCwUAA4IBAQA5n43y4VzpwcUGksziBuGH
+4j3VXCinuAMJ4LyyhvfxJFBDAkh0PVBEsC5clqxs3F6gqm1VRHlLs8818VfCEvpD
+c1p7zfvM2bG0GH7sSz4O307Ood+e/zfr3CIxSJmKt5qN1QUSKHyAr6oMqbxssaFk
+byLyfm0Wfx+DGJTbHubV0m4dujq8MkLAQARAMNCCdW1SO7K6X2xdXLjrKHgTexOg
+lLF8ckc0l/zdiu0XXOtFHbAj8eCdjFPDr2UX26SVk2mxym65C+h+YyHVGHHugeod
+nxuYzEh/xO2tx+b/vgxZCVfBRtCyAM12apDHDAm5hwTzbLqucVVJSIc2K/tZhsIW
+-----END CERTIFICATE-----`
+)
+
+type Service struct {
+	Context context.Context
+	Cancel  context.CancelFunc
+	wg      *sync.WaitGroup
+	tracer  opentracing.Tracer
+}
+
+func NewService(ctx context.Context, cancel context.CancelFunc) *Service {
+	return &Service{
+		Context: ctx,
+		Cancel:  cancel,
+		wg:      new(sync.WaitGroup),
+	}
+}
+
+// Command line
+func (s *Service) Command(startCmd *cli.Cmd) {
+	command.Run(s, startCmd)
+}
+
+// Serve
+func (s *Service) Serve() {
+	// mute GRPC logs
+	grpclog.SetLoggerV2(grpclog.NewLoggerV2(ioutil.Discard, ioutil.Discard, ioutil.Discard))
+
+	// Init sentry
+	logger.InitSentry(logger.Logger)
+
+	// create Postgres Client
+	if ok := pg.Connect(s.Context); !ok {
+		logger.Panic("Postgres connect failed")
+	}
+	// init db
+	//models.InitDb()
+
+	// initial Redis database
+	redis.InitRedis()
+
+	// init ClickHouse
+	ch.InitCh()
+	defer ch.Shutdown()
+
+	// create trace
+	tracer, closer, err := api.NewTracer()
+	if err != nil {
+		logger.Fatalf(err.Error())
+	}
+	defer closer.Close()
+
+	s.tracer = tracer
+
+	if *config.App.GrpcEnable {
+		api.StartGrpcService(s.wg, s.Context, s.tracer, s.registerHandlers)
+
+		if *config.App.HttpEnable {
+			api.StartGateway(s.wg, s.Context,
+				proto.RegisterMarkRestHandler,
+				proto.RegisterMarkGrpcHandler,
+			)
+		}
+	}
+
+	StartWebsocketGateway(s.wg, s.Context)
+
+	api.ServeAndShutdown(s.wg, s.Cancel)
+
+}
+
+// Service handlers
+func (s *Service) registerHandlers(srv *rpc.Server) {
+	candlesRepo := clickhouse.NewRepository(ch.CH)
+	pgRepo := postgres.NewRepository(pg.Psql)
+
+	proto.RegisterMarkGrpcServer(srv, grpc.NewService(candlesRepo, pgRepo, s.tracer))
+	proto.RegisterMarkRestServer(srv, rest.NewService(candlesRepo, pgRepo, s.tracer))
+}
+
+// Start HTTP to gRPC gateway server with websocket for service context
+func StartWebsocketGateway(wg *sync.WaitGroup, ctx context.Context) {
+
+	addr := "localhost:8020"
+	conn, err := net.Listen("tcp", addr)
+	if err != nil {
+		logger.Fatalf("Failed to start listener: %s", err.Error())
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		<-ctx.Done()
+		logger.Info("Start to close a client connection to the gRPC server...")
+
+		if err := conn.Close(); err != nil {
+			logger.Errorf("Failed to close a client connection to the gRPC server: %v", err)
+		} else {
+			logger.Info("Client connection to the gRPC server is successfully closed")
+		}
+	}()
+
+	pair, err := tls.X509KeyPair([]byte(cert), []byte(key))
+	if err != nil {
+		panic(err)
+	}
+	keyPair := &pair
+	certPool := x509.NewCertPool()
+	ok := certPool.AppendCertsFromPEM([]byte(cert))
+	if !ok {
+		panic("bad certs")
+	}
+
+	// Create the gRPC server with the credentials
+	grpcServerOpts := []rpc.ServerOption{
+		rpc.Creds(credentials.NewClientTLSFromCert(certPool, addr))}
+	grpcServer := rpc.NewServer(grpcServerOpts...)
+
+	// RegisterMarkRestServer
+	markRestService := &rest.Service{}
+	proto.RegisterMarkRestServer(grpcServer, markRestService)
+
+	srvMux := http.NewServeMux()
+
+	gwMux := gwruntime.NewServeMux(
+		gwruntime.WithMarshalerOption(gwruntime.MIMEWildcard, &gwruntime.JSONPb{
+			EmitDefaults: true,
+			OrigName:     true,
+		}),
+	)
+
+	// Create HTTP/gRPC gateway
+	gwruntime.HTTPError = api.CustomHTTPError
+	gwruntime.OtherErrorHandler = api.CustomOtherErrorHandler
+
+	// Wrap the gateway in the websocket proxy for bidi streams!
+	srvMux.Handle("/", wsproxy.WebsocketProxy(gwMux))
+
+	dcreds := credentials.NewTLS(&tls.Config{
+		ServerName: addr,
+		RootCAs:    certPool,
+	})
+	dopts := []rpc.DialOption{rpc.WithTransportCredentials(dcreds)}
+	//dopts := []rpc.DialOption{rpc.WithInsecure()}
+	err = proto.RegisterMarkRestHandlerFromEndpoint(ctx, gwMux, addr, dopts)
+	if err != nil {
+		logger.Fatalf("Failed to dial server %s", err.Error())
+	}
+	// Create server
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: grpcHandlerFunc(grpcServer, srvMux),
+		TLSConfig: &tls.Config{
+			NextProtos:   []string{"h2"},
+			Certificates: []tls.Certificate{*keyPair},
+		},
+	}
+
+	// Shutdown
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		<-ctx.Done()
+		//time.Sleep(1*time.Second)
+		logger.Info("Shutting down the HTTP server...")
+		if err = srv.Shutdown(ctx); err != nil {
+			logger.Errorf("Failed to shutdown HTTP server: %v", err)
+		} else {
+			logger.Info("Stopping HTTP server...")
+		}
+	}()
+
+	// Listen and serve
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		logger.Infof("Starting listening Websocket at wss://%s", addr)
+		if err := srv.Serve(tls.NewListener(conn, srv.TLSConfig)); err != http.ErrServerClosed {
+			logger.Errorf("Error during HTTP serving: %s", err)
+		} else {
+			logger.Info("HTTP server is successfully stopped.")
+		}
+	}()
+
+	// Listen and serve
+	//logger.Infof("Starting listening HTTP at http://%s", addr)
+	//logger.Fatal(srv.Serve(tls.NewListener(conn, srv.TLSConfig)))
+}
+
+// GrpcHandlerFunc returns an http.Handler that delegates to grpcServer on incoming gRPC
+// connections or otherHandler otherwise. Copied from cockroachdb.
+func grpcHandlerFunc(grpcServer http.Handler, otherHandler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// This is a partial recreation of gRPC's internal checks https://github.com/grpc/grpc-go/pull/514/files#diff-95e9a25b738459a2d3030e1e6fa2a718R61
+		if r.ProtoMajor == 2 && strings.Contains(r.Header.Get("Content-Type"), "application/grpc") {
+			grpcServer.ServeHTTP(w, r)
+		} else {
+			otherHandler.ServeHTTP(w, r)
+		}
+	})
+}
